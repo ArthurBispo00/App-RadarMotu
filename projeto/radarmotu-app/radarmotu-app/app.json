@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "RadarMotu",
+    "slug": "radarmotu",
+    "scheme": "radarmotu",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "sdkVersion": "51.0.0",
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true,
+            "minSdkVersion": 23
+          },
+          "ios": {}
+        }
+      ]
+    ],
+    "android": {
+      "package": "com.seuorg.radarmotu",
+      "permissions": [
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_SCAN"
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "com.seuorg.radarmotu",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "O Radar usa Bluetooth para localizar sua TAG próxima."
+      }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "efa16ba2-6119-4693-b839-14a9e56d6ce7"
+      }
+    }
+  }
+}

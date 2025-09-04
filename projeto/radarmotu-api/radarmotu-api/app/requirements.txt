@@ -1,0 +1,11 @@
+fastapi==0.112.2
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.34
+pydantic==2.9.1
+python-multipart==0.0.9
+python-jose==3.3.0
+passlib[bcrypt]==1.7.4
+numpy==1.26.4
+scipy==1.11.4
+filterpy==1.4.5
+paho-mqtt==2.1.0
