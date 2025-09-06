@@ -1,7 +1,7 @@
 // screens/RadarProximidade.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, StyleSheet, TouchableOpacity, Alert, Platform } from "react-native";
-import Svg, { Circle, Line, Text as SvgText } from "react-native-svg";
+import Svg, { Circle, Line, Text as SvgText } from "react-native-svg"; // Importar Text do SVG
 import { BleManager, Device, State as BleState } from "react-native-ble-plx";
 import { request, PERMISSIONS, RESULTS } from "react-native-permissions";
 import * as Haptics from "expo-haptics";
@@ -11,11 +11,11 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRoute } from "@react-navigation/native";
 import { alarmTag, getTagByPlate } from "../services/api";
 
-// ... (todas as constantes e funções utilitárias permanecem as mesmas)
 // ---------- Constantes de radar ----------
 const SIZE = 320;
 const R = SIZE / 2;
-const MAX_METERS = 20;
+// MODIFICADO: Distância máxima representada no radar agora é 8 metros
+const MAX_METERS = 8;
 const SWEEP_SPEED_DEG_PER_S = 120;
 
 // ---------- Calibração ----------
@@ -32,9 +32,42 @@ function normAngle(deg:number){ let d=deg%360; if(d<0) d+=360; return d; }
 function angDiff(a:number,b:number){ const d = Math.abs(normAngle(a)-normAngle(b)); return d>180? 360-d : d; }
 function median(a:number[]){ if(!a.length) return NaN; const b=[...a].sort((x,y)=>x-y); const m=Math.floor(b.length/2); return b.length%2? b[m] : (b[m-1]+b[m])/2; }
 function mad(a:number[], m:number){ const d=a.map(v=>Math.abs(v-m)).sort((x,y)=>x-y); const k=Math.floor(d.length/2); return d.length%2? d[k] : (d[k-1]+d[k])/2; }
-function rssiToMeters(rssi:number, TX:number, NP:number){ if(rssi==null) return null; const d = Math.pow(10,(TX - rssi)/(10*NP)); return clamp(d, 0, 100); }
-function headingFromMag({x,y}:{x:number;y:number}){ let deg = toDeg(Math.atan2(y, x)); if(deg < 0) deg += 360; return deg; }
 
+// Função de distância baseada em tabela (sem alteração, pois os pontos são os mesmos)
+function rssiToMeters(rssi: number | null): number | null {
+  if (rssi == null) return null;
+
+  const rssiDistanceMap: [number, number][] = [
+    [-90, 6.0],
+    [-80, 4.5],
+    [-70, 3.0],
+    [-60, 2.0],
+    [-50, 1.0], // RSSI mais forte: 1 metro. Vamos mapear isso para o primeiro anel de 2m, se necessário.
+  ];
+
+  if (rssi >= rssiDistanceMap[rssiDistanceMap.length - 1][0]) {
+    return rssiDistanceMap[rssiDistanceMap.length - 1][1];
+  }
+  if (rssi <= rssiDistanceMap[0][0]) {
+    return rssiDistanceMap[0][1];
+  }
+
+  for (let i = 0; i < rssiDistanceMap.length - 1; i++) {
+    const p1 = rssiDistanceMap[i];
+    const p2 = rssiDistanceMap[i + 1];
+    if (rssi >= p1[0] && rssi < p2[0]) {
+      const rssiRange = p2[0] - p1[0];
+      const distanceRange = p2[1] - p1[1];
+      const rssiOffset = rssi - p1[0];
+      const percentage = rssiOffset / rssiRange;
+      const interpolatedDistance = p1[1] + (percentage * distanceRange);
+      return interpolatedDistance;
+    }
+  }
+  return null;
+}
+
+function headingFromMag({x,y}:{x:number;y:number}){ let deg = toDeg(Math.atan2(y, x)); if(deg < 0) deg += 360; return deg; }
 
 export default function RadarProximidade(){
   useKeepAwake();
@@ -42,7 +75,6 @@ export default function RadarProximidade(){
   const plateParam: string | undefined = (route.params?.plate || "").toUpperCase();
   const tagParam: string | undefined = (route.params?.tag || "").toUpperCase();
 
-  // Estado base
   const [tagCode, setTagCode] = useState<string | null>(tagParam || null);
   const [scanning, setScanning] = useState(false);
   const [rssiRaw, setRssiRaw] = useState<number | null>(null);
@@ -51,27 +83,17 @@ export default function RadarProximidade(){
   const [txPower, setTxPower] = useState(DEFAULT_TX_POWER);
   const [nPath, setNPath] = useState(DEFAULT_N_PATH);
   const [err, setErr] = useState<string | null>(null);
-
-  // Direção (bearing) contínua
   const [heading, setHeading] = useState(0);
   const [bearing, setBearing] = useState<number | null>(null);
   const [bearingConf, setBearingConf] = useState(0);
-
-  // NOVO: Estado para controlar a vibração contínua
   const [isVibrationSilenced, setIsVibrationSilenced] = useState(false);
   const vibrationIntervalRef = useRef<NodeJS.Timeout | null>(null);
-
-  // BLE & buffers
   const managerRef = useRef(new BleManager());
   const emaRef = useRef<number | null>(null);
   const winRef = useRef<number[]>([]);
   const lastHitMsRef = useRef(0);
-
-  // Varredura (sonar)
   const [sweepDeg, setSweepDeg] = useState(0);
 
-  // ... (hooks useEffect para carregar dados, bússola e varredura permanecem os mesmos)
-  // Carregar tag por placa + calibração salva
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -88,7 +110,6 @@ export default function RadarProximidade(){
     return ()=>{ mounted=false; };
   }, [plateParam, tagCode]);
 
-  // Bússola contínua
   useEffect(() => {
     const sub = Magnetometer.addListener((d) => {
       const h = headingFromMag({ x: d.x ?? 0, y: d.y ?? 0 });
@@ -98,7 +119,6 @@ export default function RadarProximidade(){
     return () => sub && sub.remove();
   }, []);
 
-  // Varredura 360° (JS RAF loop — simples e estável)
   useEffect(() => {
     let raf:number; let last = Date.now();
     const tick = () => {
@@ -110,42 +130,30 @@ export default function RadarProximidade(){
     return () => cancelAnimationFrame(raf);
   }, []);
 
-  // NOVO: useEffect para gerenciar a vibração contínua de proximidade
   useEffect(() => {
     const startContinuousVibration = () => {
-      if (vibrationIntervalRef.current) return; // Já está vibrando, não faz nada
+      if (vibrationIntervalRef.current) return;
       vibrationIntervalRef.current = setInterval(() => {
         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-      }, 400); // Vibra a cada 400ms
+      }, 400);
     };
-
     const stopContinuousVibration = () => {
       if (vibrationIntervalRef.current) {
         clearInterval(vibrationIntervalRef.current);
         vibrationIntervalRef.current = null;
       }
     };
-
-    // CONDIÇÃO DE INÍCIO: < 2 metros e não silenciado pelo usuário
     if (meters != null && meters < 2 && !isVibrationSilenced) {
       startContinuousVibration();
     } else {
-      // CONDIÇÃO DE PARADA: > 2 metros OU silenciado
       stopContinuousVibration();
     }
-    
-    // "Rearma" o sistema se o usuário se afastar
     if (meters != null && meters >= 2) {
         if(isVibrationSilenced) setIsVibrationSilenced(false);
     }
-
-    // Limpeza ao desmontar o componente
     return () => stopContinuousVibration();
+  }, [meters, isVibrationSilenced]);
 
-  }, [meters, isVibrationSilenced]); // Roda sempre que a distância ou o estado de silêncio mudar
-
-  
-  // ... (funções ensurePermissions, updateBearingContinuous, toggleScan, etc., permanecem as mesmas)
   async function ensurePermissions() {
     try {
       if (Platform.OS === "android") {
@@ -161,6 +169,7 @@ export default function RadarProximidade(){
       return true;
     } catch (e:any) { Alert.alert("Permissões", e?.message || "Permissão negada"); return false; }
   }
+
   type DirSample = { t:number; h:number; r:number };
   const dirWinRef = useRef<DirSample[]>([]);
   function updateBearingContinuous(rssi:number){
@@ -189,6 +198,7 @@ export default function RadarProximidade(){
     const conf = clamp(Math.sqrt(bx*bx + by*by), 0, 1);
     setBearing(br); setBearingConf(conf);
   }
+
   async function toggleScan(){
     const mgr = managerRef.current;
     if (scanning){
@@ -218,12 +228,16 @@ export default function RadarProximidade(){
       const smooth = Math.round(emaRef.current);
       setRssiRaw(Math.round(device.rssi));
       setRssiSmooth(smooth);
-      const d = rssiToMeters(smooth, txPower, nPath);
+
+      const d = rssiToMeters(smooth); // Usando a função de distância baseada em tabela
+      
       if (d != null) setMeters(d);
       updateBearingContinuous(smooth);
     });
   }
+
   useEffect(()=>()=>{ try{ managerRef.current.stopDeviceScan(); }catch{} },[]);
+
   const calibrateOneMeter = async () => {
     if (!scanning){ Alert.alert("Calibração", "Inicie o sonar para calibrar."); return; }
     const samples:number[] = []; winRef.current = [];
@@ -242,6 +256,7 @@ export default function RadarProximidade(){
       }
     }, 80);
   };
+
   const onBuzz = async () => {
     try {
       const tag = (tagCode || "TAG01").toUpperCase();
@@ -249,17 +264,18 @@ export default function RadarProximidade(){
       Alert.alert("Comando enviado", `TOGGLE_BUZZER → ${tag}`);
     } catch { Alert.alert("Erro", "Falha ao enviar comando para a TAG."); }
   };
+
+  // MODIFICADO: Blip da moto ajustado para nova MAX_METERS
   const blip = useMemo(() => {
     if (meters == null) return null;
-    const rRel = clamp(meters / MAX_METERS, 0, 1);
-    const rPx = 8 + rRel * (R - 12);
+    const rRel = clamp(meters / MAX_METERS, 0, 1); // Clamp para 0-1, onde 1 é MAX_METERS
+    const rPx = 8 + rRel * (R - 12); // Pequena margem para o blip não ir totalmente na borda
     const angle = bearing ?? 0;
     const x = R + rPx * Math.sin(toRad(angle));
     const y = R - rPx * Math.cos(toRad(angle));
     return { x, y, rPx, angle };
   }, [meters, bearing]);
 
-  // Haptics do "ping" da varredura (sem alteração)
   useEffect(() => {
     if (!blip) return;
     const diff = angDiff(sweepDeg, blip.angle);
@@ -274,73 +290,62 @@ export default function RadarProximidade(){
 
   const ringColor = useMemo(()=>{
     if (meters == null) return "#334155";
-    if (meters < 2) return "#ef4444"; // Vermelho para alerta máximo
-    if (meters < 5) return "#f97316"; // Laranja
-    if (meters < 10) return "#f59e0b"; // Ambar
-    return "#34d399"; // Verde
+    if (meters < 2) return "#ef4444";
+    if (meters < 5) return "#f97316";
+    if (meters < 10) return "#f59e0b"; // Este limite pode ser revisado, já que MAX_METERS é 8
+    return "#34d399";
   }, [meters]);
 
   const title = plateParam ? `Sonar — ${plateParam}${tagCode ? ` / ${tagCode}` : ""}` : `Sonar ${tagCode || ""}`;
 
   return (
     <View style={s.c}>
-      <Text style={s.t}>{title}</Text>
+        <Text style={s.t}>{title}</Text>
+        <View style={s.radarWrap}>
+            <Svg width={SIZE} height={SIZE}>
+                {/* Fundo */}
+                <Circle cx={R} cy={R} r={R} fill="#0F131A" stroke="#273244" strokeWidth={2} />
 
-      <View style={s.radarWrap}>
-        {/* ... (código SVG do radar sem alteração) */}
-        <Svg width={SIZE} height={SIZE}>
-          <Circle cx={R} cy={R} r={R} fill="#0F131A" stroke="#273244" strokeWidth={2} />
-          <Circle cx={R} cy={R} r={R*0.75} fill="none" stroke="#263142" strokeWidth={1}/>
-          <Circle cx={R} cy={R} r={R*0.5}  fill="none" stroke="#263142" strokeWidth={1}/>
-          <Circle cx={R} cy={R} r={R*0.25} fill="none" stroke="#263142" strokeWidth={1}/>
-          {(() => {
-            const x2 = R + (R-4) * Math.sin(toRad(sweepDeg)); const y2 = R - (R-4) * Math.cos(toRad(sweepDeg));
-            return (<Line x1={R} y1={R} x2={x2} y2={y2} stroke="#38BDF8" strokeOpacity={0.85} strokeWidth={3} strokeLinecap="round" />);
-          })()}
-          {blip && (
-            <>
-              <Circle cx={blip.x} cy={blip.y} r={8} fill={ringColor} stroke="#0F131A" strokeWidth={2} />
-              <SvgText x={blip.x} y={blip.y - 12} fill="#E5E7EB" fontSize="10" fontWeight="bold" textAnchor="middle">🏍️</SvgText>
-            </>
-          )}
-          <Circle cx={R} cy={R} r={5} fill="#22DD44" />
-        </Svg>
-      </View>
+                {/* Anéis e Etiquetas de Distância */}
+                {/* Raio 8m (Borda externa) */}
+                <Circle cx={R} cy={R} r={R} fill="none" stroke="#263142" strokeWidth={1}/>
+                <SvgText x={R + 5} y={15} fill="#7A8BAF" fontSize="12" textAnchor="start">8m</SvgText>
 
-      {/* MODIFICADO: Botão de silenciar aparece condicionalmente */}
-      {meters != null && meters < 2 && !isVibrationSilenced && (
-        <View style={s.silenceContainer}>
-            <TouchableOpacity style={s.btnSilence} onPress={() => setIsVibrationSilenced(true)}>
-                <Text style={s.btnSilenceText}>Parar Vibração</Text>
-            </TouchableOpacity>
+                {/* Raio 6m */}
+                <Circle cx={R} cy={R} r={R * (6/MAX_METERS)} fill="none" stroke="#263142" strokeWidth={1}/>
+                <SvgText x={R + 5} y={R - (R * (6/MAX_METERS)) + 15} fill="#7A8BAF" fontSize="12" textAnchor="start">6m</SvgText>
+
+                {/* Raio 4m */}
+                <Circle cx={R} cy={R} r={R * (4/MAX_METERS)}  fill="none" stroke="#263142" strokeWidth={1}/>
+                <SvgText x={R + 5} y={R - (R * (4/MAX_METERS)) + 15} fill="#7A8BAF" fontSize="12" textAnchor="start">4m</SvgText>
+
+                {/* Raio 2m */}
+                <Circle cx={R} cy={R} r={R * (2/MAX_METERS)} fill="none" stroke="#263142" strokeWidth={1}/>
+                <SvgText x={R + 5} y={R - (R * (2/MAX_METERS)) + 15} fill="#7A8BAF" fontSize="12" textAnchor="start">2m</SvgText>
+
+
+                {/* Varredura */}
+                {(() => { const x2 = R + (R-4) * Math.sin(toRad(sweepDeg)); const y2 = R - (R-4) * Math.cos(toRad(sweepDeg)); return (<Line x1={R} y1={R} x2={x2} y2={y2} stroke="#38BDF8" strokeOpacity={0.85} strokeWidth={3} strokeLinecap="round" />); })()}
+
+                {/* Blip da moto */}
+                {blip && (<><Circle cx={blip.x} cy={blip.y} r={8} fill={ringColor} stroke="#0F131A" strokeWidth={2} /><SvgText x={blip.x} y={blip.y - 12} fill="#E5E7EB" fontSize="10" fontWeight="bold" textAnchor="middle">🏍️</SvgText></>)}
+                
+                {/* Centro (você) */}
+                <Circle cx={R} cy={R} r={5} fill="#22DD44" />
+            </Svg>
         </View>
-      )}
 
-      {/* ÁREA DE CONTROLES */}
-      <View style={s.row}>
-        <TouchableOpacity style={[s.btn, scanning ? s.btnStop : s.btnGo]} onPress={toggleScan}>
-          <Text style={s.btnT}>{scanning ? "Parar Sonar" : "Iniciar Sonar"}</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={[s.btn, s.btnBuzz]} onPress={onBuzz}>
-          <Text style={s.btnTB}>Buzinar / LED</Text>
-        </TouchableOpacity>
-      </View>
-      <View style={s.row}>
-        <TouchableOpacity style={[s.btn, s.btnCal]} onPress={calibrateOneMeter}>
-          <Text style={s.btnT}>Calibrar @1m</Text>
-        </TouchableOpacity>
-        <View style={[s.param, {borderColor:"#1F2733"}]}>
-          <Text style={s.paramT}>TX:{txPower} dBm  ·  N:{nPath.toFixed(1)}</Text>
+        {meters != null && meters < 2 && !isVibrationSilenced && (
+            <View style={s.silenceContainer}><TouchableOpacity style={s.btnSilence} onPress={() => setIsVibrationSilenced(true)}><Text style={s.btnSilenceText}>Parar Vibração</Text></TouchableOpacity></View>
+        )}
+
+        <View style={s.row}><TouchableOpacity style={[s.btn, scanning ? s.btnStop : s.btnGo]} onPress={toggleScan}><Text style={s.btnT}>{scanning ? "Parar Sonar" : "Iniciar Sonar"}</Text></TouchableOpacity><TouchableOpacity style={[s.btn, s.btnBuzz]} onPress={onBuzz}><Text style={s.btnTB}>Buzinar / LED</Text></TouchableOpacity></View>
+        <View style={s.row}><TouchableOpacity style={[s.btn, s.btnCal]} onPress={calibrateOneMeter}><Text style={s.btnT}>Calibrar @1m</Text></TouchableOpacity><View style={[s.param, {borderColor:"#1F2733"}]}><Text style={s.paramT}>TX:{txPower} dBm  ·  N:{nPath.toFixed(1)}</Text></View></View>
+        
+        <View style={s.kpiContainer}>
+            <View style={s.kpiRow}><View style={s.kpiItem}><Text style={s.kpiLabel}>RSSI</Text><Text style={s.kpiValue}>{rssiSmooth ?? (rssiRaw ?? "—")}</Text></View><View style={s.kpiItem}><Text style={s.kpiLabel}>Distância</Text><Text style={s.kpiValue}>{meters != null ? `${meters.toFixed(1)}m` : "—"}</Text></View></View>
+            <View style={s.kpiRow}><View style={s.kpiItem}><Text style={s.kpiLabel}>Direção</Text><Text style={s.kpiValue}>{bearing != null ? `${Math.round(bearing)}°` : "—"}</Text></View><View style={s.kpiItem}><Text style={s.kpiLabel}>Confiança</Text><Text style={s.kpiValue}>{`${Math.round(bearingConf * 100)}%`}</Text></View></View>
         </View>
-      </View>
-      
-      {/* SEÇÃO DE KPIs */}
-      <View style={s.kpiContainer}>
-        {/* ... (código dos KPIs sem alteração) */}
-        <View style={s.kpiRow}><View style={s.kpiItem}><Text style={s.kpiLabel}>RSSI</Text><Text style={s.kpiValue}>{rssiSmooth ?? (rssiRaw ?? "—")}</Text></View><View style={s.kpiItem}><Text style={s.kpiLabel}>Distância</Text><Text style={s.kpiValue}>{meters != null ? `${meters.toFixed(1)}m` : "—"}</Text></View></View>
-        <View style={s.kpiRow}><View style={s.kpiItem}><Text style={s.kpiLabel}>Direção</Text><Text style={s.kpiValue}>{bearing != null ? `${Math.round(bearing)}°` : "—"}</Text></View><View style={s.kpiItem}><Text style={s.kpiLabel}>Confiança</Text><Text style={s.kpiValue}>{`${Math.round(bearingConf * 100)}%`}</Text></View></View>
-      </View>
-
     </View>
   );
 }
@@ -348,29 +353,10 @@ export default function RadarProximidade(){
 const s = StyleSheet.create({
   c:{ flex:1, backgroundColor:"#0D1117", padding:16, justifyContent: 'center' },
   t:{ color:"#fff", fontSize:18, fontWeight:"bold", textAlign: 'center', marginBottom: 20 },
-  radarWrap:{ alignSelf:"center", width:SIZE, height:SIZE, borderRadius:R, overflow:"hidden",
-    backgroundColor:"#0F131A", borderWidth:1, borderColor:"#1E293B", marginBottom: 10 }, // Diminuí a margem inferior do radar
-
-  // NOVO: Estilos para o botão de silenciar
-  silenceContainer: {
-    paddingHorizontal: 10,
-    marginTop: 10,
-    marginBottom: -4, // Puxa os botões de baixo para mais perto
-  },
-  btnSilence: {
-    backgroundColor: '#7f1d1d', // Vermelho escuro
-    paddingVertical: 10,
-    borderRadius: 8,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#991b1b',
-  },
-  btnSilenceText: {
-    color: '#fecaca', // Texto vermelho claro
-    fontWeight: 'bold',
-    fontSize: 16,
-  },
-
+  radarWrap:{ alignSelf:"center", width:SIZE, height:SIZE, borderRadius:R, overflow:"hidden", backgroundColor:"#0F131A", borderWidth:1, borderColor:"#1E293B", marginBottom: 10 },
+  silenceContainer: { paddingHorizontal: 10, marginTop: 10, marginBottom: -4, },
+  btnSilence: { backgroundColor: '#7f1d1d', paddingVertical: 10, borderRadius: 8, alignItems: 'center', borderWidth: 1, borderColor: '#991b1b', },
+  btnSilenceText: { color: '#fecaca', fontWeight: 'bold', fontSize: 16, },
   row:{ flexDirection:"row", gap:12, marginTop:14, alignItems:"center", paddingHorizontal: 10 },
   btn:{ flex:1, paddingVertical:14, borderRadius:10, alignItems:"center" },
   btnGo:{ backgroundColor:"#22DD44" },
