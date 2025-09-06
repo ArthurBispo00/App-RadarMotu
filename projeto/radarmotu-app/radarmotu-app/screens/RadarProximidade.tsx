@@ -1,27 +1,25 @@
+// screens/RadarProximidade.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, StyleSheet, TouchableOpacity, Alert, Platform } from "react-native";
-import Svg, { Circle, Line as SvgLine, Text as SvgText } from "react-native-svg";
+import Svg, { Circle, Line, Text as SvgText } from "react-native-svg";
 import { BleManager, Device, State as BleState } from "react-native-ble-plx";
 import { request, PERMISSIONS, RESULTS } from "react-native-permissions";
 import * as Haptics from "expo-haptics";
-import * as Speech from "expo-speech";
 import { useKeepAwake } from "expo-keep-awake";
 import { Magnetometer } from "expo-sensors";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRoute } from "@react-navigation/native";
 import { alarmTag, getTagByPlate } from "../services/api";
 
-// ---------- Constantes ----------
-const SIZE = 320;                 // diâmetro do radar
-const R = SIZE / 2;               // raio em px
-const MAX_METERS = 20;            // distância máxima representada no radar (ajuste pro seu pátio)
-const EDGE_MARGIN = 12;           // margem interna da borda
-const CENTER_MIN = 2;             // distância visual mínima do centro
-const SWEEP_SPEED_DEG_PER_S = 120;
+// ---------- Constantes de radar ----------
+const SIZE = 320;                 // diâmetro do radar
+const R = SIZE / 2;               // raio em px
+const MAX_METERS = 20;            // distância máxima representada no radar
+const SWEEP_SPEED_DEG_PER_S = 120; // velocidade da varredura (graus/seg)
 
-// Calibração
-const DEFAULT_TX_POWER = -61;     // RSSI @1m (ajuste com Calibrar @1m)
-const DEFAULT_N_PATH = 2.5;
+// ---------- Calibração ----------
+const DEFAULT_TX_POWER = -61;     // RSSI @1m
+const DEFAULT_N_PATH = 2.5;       // 2.0~3.5 indoor
 const STORAGE_TX = "radar.txpower";
 const STORAGE_NP = "radar.npath";
 
@@ -30,10 +28,9 @@ const clamp = (v:number,a:number,b:number)=>Math.max(a,Math.min(b,v));
 const toRad = (deg:number)=>deg*Math.PI/180;
 const toDeg = (rad:number)=>rad*180/Math.PI;
 function normAngle(deg:number){ let d=deg%360; if(d<0) d+=360; return d; }
-function angDiff180(a:number,b:number){
-  // diferença de a→b em [-180,+180]
-  let d = (b - a + 540) % 360 - 180;
-  return d;
+function angDiff(a:number,b:number){ // menor diferença absoluta 0..180
+  const d = Math.abs(normAngle(a)-normAngle(b));
+  return d>180? 360-d : d;
 }
 function median(a:number[]){ if(!a.length) return NaN; const b=[...a].sort((x,y)=>x-y); const m=Math.floor(b.length/2); return b.length%2? b[m] : (b[m-1]+b[m])/2; }
 function mad(a:number[], m:number){ const d=a.map(v=>Math.abs(v-m)).sort((x,y)=>x-y); const k=Math.floor(d.length/2); return d.length%2? d[k] : (d[k-1]+d[k])/2; }
@@ -42,15 +39,10 @@ function rssiToMeters(rssi:number, TX:number, NP:number){
   const d = Math.pow(10,(TX - rssi)/(10*NP));
   return clamp(d, 0, 100);
 }
-function headingFromMag({x,y}:{x:number;y:number}){ let deg = toDeg(Math.atan2(y, x)); if(deg < 0) deg += 360; return deg; }
-function arrowFromDelta(delta:number){
-  // delta: turn right positivo, left negativo (relativo à frente do usuário)
-  const a = Math.abs(delta);
-  if (a <= 22.5) return "⬆️";
-  if (a <= 67.5)  return delta > 0 ? "↗️" : "↖️";
-  if (a <= 112.5) return delta > 0 ? "➡️" : "⬅️";
-  if (a <= 157.5) return delta > 0 ? "↘️" : "↙️";
-  return "⬇️";
+function headingFromMag({x,y}:{x:number;y:number}){ // 0..360
+  let deg = toDeg(Math.atan2(y, x));
+  if(deg < 0) deg += 360;
+  return deg;
 }
 
 export default function RadarProximidade(){
@@ -64,48 +56,34 @@ export default function RadarProximidade(){
   const [scanning, setScanning] = useState(false);
   const [rssiRaw, setRssiRaw] = useState<number | null>(null);
   const [rssiSmooth, setRssiSmooth] = useState<number | null>(null);
-  const [metersSmoothed, setMetersSmoothed] = useState<number | null>(null);
+  const [meters, setMeters] = useState<number | null>(null);
   const [txPower, setTxPower] = useState(DEFAULT_TX_POWER);
   const [nPath, setNPath] = useState(DEFAULT_N_PATH);
   const [err, setErr] = useState<string | null>(null);
 
-  // Direção (bearing) absoluta estimada
+  // Direção (bearing) contínua
   const [heading, setHeading] = useState(0);
-  const [bearingDeg, setBearingDeg] = useState<number | null>(null); // 0..360 (absoluto)
-  const [bearingConf, setBearingConf] = useState(0);                 // 0..1
+  const [bearing, setBearing] = useState<number | null>(null); // 0..360 (onde a moto estaria)
+  const [bearingConf, setBearingConf] = useState(0);           // 0..1
 
   // BLE & buffers
   const managerRef = useRef(new BleManager());
-  const emaRssiRef = useRef<number | null>(null);
+  const emaRef = useRef<number | null>(null);
   const winRef = useRef<number[]>([]);
   const lastHitMsRef = useRef(0);
-
-  // EMA da distância (extra estabilidade)
-  const emaDistRef = useRef<number | null>(null);
-
-  // Suavização circular do bearing via vetor unitário
-  const bearingVecRef = useRef<{x:number,y:number} | null>(null);
 
   // Varredura (sonar)
   const [sweepDeg, setSweepDeg] = useState(0);
 
-  // --------- GUIA DE NAVEGAÇÃO (texto/voz) ---------
-  const [instruction, setInstruction] = useState<string>("Aguardando direção...");
-  const [arrow, setArrow] = useState<string>("⬆️");
-  const lastInstrRef = useRef<string>("");
-  const lastTtsRef = useRef<number>(0);
-  const lastInstrChangeRef = useRef<number>(0);
-
-  const SPEAK_MIN_MS = 2000;    // mínimo entre falas
-  const INSTR_MIN_MS = 1200;    // mínimo entre trocas de instrução
-  const YAW_STICK = 6;          // histerese angular em graus para evitar oscilações
-
-  // Carregar TAG pela placa + calibração salva
+  // Carregar tag por placa + calibração salva
   useEffect(() => {
     let mounted = true;
     (async () => {
       if (!tagCode && plateParam) {
-        try { const t = await getTagByPlate(plateParam); if (mounted) setTagCode(t); } catch {}
+        try {
+          const t = await getTagByPlate(plateParam);
+          if (mounted) setTagCode(t);
+        } catch {}
       }
       const tx = await AsyncStorage.getItem(STORAGE_TX);
       const np = await AsyncStorage.getItem(STORAGE_NP);
@@ -127,11 +105,14 @@ export default function RadarProximidade(){
     return () => sub && sub.remove();
   }, []);
 
-  // Varredura 360° (loop JS)
+  // Varredura 360° (JS RAF loop — simples e estável)
   useEffect(() => {
-    let raf:number, last=Date.now();
+    let raf:number;
+    let last = Date.now();
     const tick = () => {
-      const now = Date.now(), dt = (now-last)/1000; last=now;
+      const now = Date.now();
+      const dt = (now - last) / 1000;
+      last = now;
       setSweepDeg(prev => normAngle(prev + SWEEP_SPEED_DEG_PER_S * dt));
       raf = requestAnimationFrame(tick);
     };
@@ -161,57 +142,44 @@ export default function RadarProximidade(){
     }
   }
 
-  // Estimativa contínua do bearing (RSSI x heading) com suavização circular
+  // Estimativa de direção (RSSI x heading) — janela de 6s
   type DirSample = { t:number; h:number; r:number };
   const dirWinRef = useRef<DirSample[]>([]);
   function updateBearingContinuous(rssi:number){
     const now = Date.now();
+    // mantemos últimos 6s
     dirWinRef.current.push({ t: now, h: heading, r: rssi });
     dirWinRef.current = dirWinRef.current.filter(s => now - s.t <= 6000);
 
+    // precisa haver variação de heading
     const hs = dirWinRef.current.map(s=>s.h);
-    if (hs.length < 12) return;
-
-    // precisa haver rotação suficiente
+    if (hs.length < 12) return; // amostras mínimas
     const minH = Math.min(...hs), maxH = Math.max(...hs);
-    const spread = (maxH - minH + 360) % 360;
-    if (spread < 60) { setBearingConf(0); return; }
+    const spread = (maxH - minH + 360) % 360; // aproxima
+    if (spread < 60) { setBearingConf(0); return; } // não girou o suficiente
 
-    // pesos por qualidade do RSSI (robusto)
+    // normaliza pesos por RSSI (quanto melhor, maior peso)
     const rs = dirWinRef.current.map(s=>s.r);
     const rMed = median(rs);
     const rMad = mad(rs, rMed) || 1;
-
-    let vx=0, vy=0, wsum=0;
+    // z-score robusto (quanto mais positivo, melhor)
+    let sumX=0, sumY=0, sumW=0;
     dirWinRef.current.forEach(s=>{
       const z = (s.r - rMed) / (1.4826 * rMad);
       const w = Math.max(0, z + 1); // só positivo
       if (w > 0) {
-        vx += w * Math.cos(toRad(s.h));
-        vy += w * Math.sin(toRad(s.h));
-        wsum += w;
+        sumX += w * Math.cos(toRad(s.h));
+        sumY += w * Math.sin(toRad(s.h));
+        sumW += w;
       }
     });
-    if (wsum <= 0) { setBearingConf(0); return; }
-
-    // vetor “melhor direção”
-    let nx = vx/wsum, ny = vy/wsum;
-    const len = Math.hypot(nx, ny) || 1;
-    nx /= len; ny /= len;
-    const conf = clamp(Math.sqrt((vx/wsum)**2 + (vy/wsum)**2), 0, 1);
-
-    if (conf > 0.35) {
-      const betaA = 0.18; // suavização angular
-      const prev = bearingVecRef.current || { x: nx, y: ny };
-      const mix = { x: (1-betaA)*prev.x + betaA*nx, y: (1-betaA)*prev.y + betaA*ny };
-      const L = Math.hypot(mix.x, mix.y) || 1;
-      const sx = mix.x / L, sy = mix.y / L;
-      bearingVecRef.current = { x: sx, y: sy };
-      setBearingDeg(normAngle(toDeg(Math.atan2(sy, sx))));
-      setBearingConf(conf);
-    } else {
-      setBearingConf(conf);
-    }
+    if (sumW <= 0) { setBearingConf(0); return; }
+    const bx = sumX / sumW, by = sumY / sumW;
+    const br = normAngle(toDeg(Math.atan2(by, bx)));
+    // confiança ~ razão do vetor resultante
+    const conf = clamp(Math.sqrt(bx*bx + by*by), 0, 1);
+    setBearing(br);
+    setBearingConf(conf);
   }
 
   // Inicia/para scan BLE
@@ -227,51 +195,34 @@ export default function RadarProximidade(){
     const st = await mgr.state(); if (st !== BleState.PoweredOn){ Alert.alert("Bluetooth", "Ative o Bluetooth."); return; }
 
     setErr(null); setScanning(true);
-    emaRssiRef.current = null; winRef.current = []; dirWinRef.current = [];
-    emaDistRef.current = null;
+    emaRef.current = null; winRef.current = []; dirWinRef.current = [];
 
     mgr.startDeviceScan(null, { allowDuplicates: true }, (error, device: Device | null) => {
       if (error){ setErr(error.message); setScanning(false); return; }
       if (!device) return;
-
-      // Nome/LOCALNAME da TAG tolerante (trim + includes)
-      const name = (device.localName || device.name || "").toUpperCase().trim();
-      const wanted = tagCode.toUpperCase().trim();
-      if (!name || !wanted || !name.includes(wanted)) return;
+      const name = (device.localName || device.name || "").toUpperCase();
+      if (name !== tagCode.toUpperCase()) return;
       if (typeof device.rssi !== "number") return;
 
-      // janela + mediana/MAD (outliers)
-      const w = winRef.current;
-      w.push(device.rssi);
-      if (w.length > 40) w.shift();
-      const med = median(w);
-      const _mad = mad(w, med) || 1;
+      // janela + mediana/MAD
+      const win = winRef.current;
+      win.push(device.rssi);
+      if (win.length > 25) win.shift();
+      const med = median(win);
+      const _mad = mad(win, med) || 1;
       const cutLow = med - 3*_mad, cutHigh = med + 3*_mad;
       const clipped = clamp(device.rssi, cutLow, cutHigh);
 
-      // EMA de RSSI (estável)
-      const alphaRssi = 0.18;
-      emaRssiRef.current = emaRssiRef.current == null ? clipped : (alphaRssi*clipped + (1-alphaRssi)*(emaRssiRef.current as number));
-      const smooth = Math.round(emaRssiRef.current);
+      // EMA
+      const alpha = 0.25;
+      emaRef.current = emaRef.current == null ? clipped : (alpha*clipped + (1-alpha)*(emaRef.current as number));
+      const smooth = Math.round(emaRef.current);
       setRssiRaw(Math.round(device.rssi));
       setRssiSmooth(smooth);
 
-      // Distância por modelo + EMA da distância + histerese (com init correto)
+      // Distância
       const d = rssiToMeters(smooth, txPower, nPath);
-      if (d != null) {
-        if (emaDistRef.current == null) {
-          emaDistRef.current = d;
-          setMetersSmoothed(d);
-        } else {
-          const alphaDist = 0.15;
-          const prev = emaDistRef.current;
-          const cand = alphaDist * d + (1 - alphaDist) * prev;
-          if (Math.abs(cand - prev) > 0.05) { // ignora “respiração” < 5 cm
-            emaDistRef.current = cand;
-            setMetersSmoothed(cand);
-          }
-        }
-      }
+      if (d != null) setMeters(d);
 
       // Atualiza direção contínua
       updateBearingContinuous(smooth);
@@ -304,7 +255,7 @@ export default function RadarProximidade(){
     }, 80);
   };
 
-  // Buzinar
+  // “Buzinar”
   const onBuzz = async () => {
     try {
       const tag = (tagCode || "TAG01").toUpperCase();
@@ -315,21 +266,22 @@ export default function RadarProximidade(){
     }
   };
 
-  // ====== POSIÇÃO DO BLIP (longe -> borda, perto -> centro) ======
+  // Posição do blip da moto no radar (centro = você, raio proporcional à distância)
   const blip = useMemo(() => {
-    if (metersSmoothed == null) return null;
-    const norm = clamp(metersSmoothed / MAX_METERS, 0, 1); // 0..1
-    const rPx = CENTER_MIN + norm * (R - EDGE_MARGIN - CENTER_MIN);
-    const angle = bearingDeg ?? 0; // se ainda sem direção, 0° (topo)
-    const x = R + rPx * Math.sin(toRad(angle)); // sin -> x
+    if (meters == null) return null;
+    // raio relativo: 0 no centro, 1 na borda
+    const rRel = clamp(meters / MAX_METERS, 0, 1); // <<<<<<<<<<< AQUI ESTÁ A CORREÇÃO
+    const rPx = 8 + rRel * (R - 12); // pequena margem
+    const angle = bearing ?? 0;      // se não sabe direção, fixa em 0 (topo)
+    const x = R + rPx * Math.sin(toRad(angle)); // sin -> x (porque ângulo 0 fica pra cima)
     const y = R - rPx * Math.cos(toRad(angle)); // cos -> y
-    return { x, y, angle };
-  }, [metersSmoothed, bearingDeg]);
+    return { x, y, rPx, angle };
+  }, [meters, bearing]);
 
-  // Ping + haptics quando a varredura cruza o blip
+  // Quando a varredura "acerta" o blip: ping + haptics
   useEffect(() => {
     if (!blip) return;
-    const diff = Math.abs(angDiff180(sweepDeg, blip.angle));
+    const diff = angDiff(sweepDeg, blip.angle);
     if (diff < 10) {
       const now = Date.now();
       if (now - lastHitMsRef.current > 500) {
@@ -341,67 +293,12 @@ export default function RadarProximidade(){
 
   // Cores conforme distância
   const ringColor = useMemo(()=>{
-    if (metersSmoothed == null) return "#334155";
-    if (metersSmoothed < 2) return "#22DD44";
-    if (metersSmoothed < 5) return "#A3E635";
-    if (metersSmoothed < 10) return "#F59E0B";
+    if (meters == null) return "#334155";
+    if (meters < 2) return "#22DD44";
+    if (meters < 5) return "#A3E635";
+    if (meters < 10) return "#F59E0B";
     return "#F87171";
-  }, [metersSmoothed]);
-
-  // ====== GUIA: calcula instrução textual + seta ======
-  useEffect(() => {
-    const now = Date.now();
-
-    if (metersSmoothed == null || bearingDeg == null) {
-      const msg = "Aguardando direção...";
-      if (now - lastInstrChangeRef.current > INSTR_MIN_MS && msg !== lastInstrRef.current) {
-        setInstruction(msg); setArrow("⬆️");
-        lastInstrRef.current = msg; lastInstrChangeRef.current = now;
-      }
-      return;
-    }
-
-    if (bearingConf < 0.35) {
-      const msg = "Gire devagar 360° para obter direção";
-      if (now - lastInstrChangeRef.current > INSTR_MIN_MS && msg !== lastInstrRef.current) {
-        setInstruction(msg); setArrow("🔄");
-        lastInstrRef.current = msg; lastInstrChangeRef.current = now;
-      }
-      return;
-    }
-
-    // delta relativo à frente do usuário: direita = +, esquerda = -
-    let delta = angDiff180(heading, bearingDeg);
-
-    // histerese angular suave (evita ficar trocando “levemente”/“vire” perto do limiar)
-    const prev = lastInstrRef.current;
-    if (prev.includes("Levemente") || prev.includes("Vire")) {
-      if (Math.abs(delta) < YAW_STICK) delta = 0;
-    }
-
-    const absd = Math.abs(delta);
-    let msg = "";
-    if (metersSmoothed < 1.5) msg = "Chegou • a ≤1,5 m";
-    else if (absd <= 15) msg = "Siga em frente";
-    else if (absd <= 35) msg = delta > 0 ? "Levemente à direita" : "Levemente à esquerda";
-    else if (absd <= 100) msg = delta > 0 ? "Vire à direita" : "Vire à esquerda";
-    else msg = "Retorne";
-
-    const arr = arrowFromDelta(delta);
-
-    // aplica limites de troca e fala
-    if (now - lastInstrChangeRef.current > INSTR_MIN_MS && msg !== lastInstrRef.current) {
-      setInstruction(msg);
-      setArrow(arr);
-      lastInstrRef.current = msg;
-      lastInstrChangeRef.current = now;
-
-      if (now - lastTtsRef.current > SPEAK_MIN_MS) {
-        try { Speech.speak(msg, { language: "pt-BR", pitch: 1.0, rate: 1.0 }); } catch {}
-        lastTtsRef.current = now;
-      }
-    }
-  }, [heading, bearingDeg, bearingConf, metersSmoothed]);
+  }, [meters]);
 
   const title = plateParam ? `Sonar — ${plateParam}${tagCode ? ` / ${tagCode}` : ""}` : `Sonar ${tagCode || ""}`;
 
@@ -415,7 +312,7 @@ export default function RadarProximidade(){
           <Circle cx={R} cy={R} r={R} fill="#0F131A" stroke="#273244" strokeWidth={2} />
           {/* Anéis */}
           <Circle cx={R} cy={R} r={R*0.75} fill="none" stroke="#263142" strokeWidth={1}/>
-          <Circle cx={R} cy={R} r={R*0.5}  fill="none" stroke="#263142" strokeWidth={1}/>
+          <Circle cx={R} cy={R} r={R*0.5}  fill="none" stroke="#263142" strokeWidth={1}/>
           <Circle cx={R} cy={R} r={R*0.25} fill="none" stroke="#263142" strokeWidth={1}/>
 
           {/* Varredura */}
@@ -423,7 +320,7 @@ export default function RadarProximidade(){
             const x2 = R + (R-4) * Math.sin(toRad(sweepDeg));
             const y2 = R - (R-4) * Math.cos(toRad(sweepDeg));
             return (
-              <SvgLine
+              <Line
                 x1={R}
                 y1={R}
                 x2={x2}
@@ -451,22 +348,16 @@ export default function RadarProximidade(){
         </Svg>
       </View>
 
-      {/* GUIA DE NAVEGAÇÃO */}
-      <View style={s.guideBox}>
-        <Text style={s.arrow}>{arrow}</Text>
-        <View style={{flex:1}}>
-          <Text style={s.guideMain}>{instruction}</Text>
-          <Text style={s.guideSub}>
-            Distância: {metersSmoothed != null ? `${metersSmoothed.toFixed(1)} m` : "—"}  ·  Confiança: {Math.round(bearingConf*100)}%
-          </Text>
-        </View>
-      </View>
-
-      {/* KPIs + Diagnóstico */}
       <View style={s.kpis}>
-        <Text style={s.info}>TAG alvo: {tagCode || "—"}</Text>
-        <Text style={s.info}>RSSI (raw/smooth): {rssiRaw ?? "—"} / {rssiSmooth ?? "—"} dBm</Text>
-        {err && <Text style={[s.info, {color:"#FCA5A5"}]}>Erro: {err}</Text>}
+        <Text style={s.info}>RSSI: {rssiSmooth ?? (rssiRaw ?? "—")} dBm</Text>
+        <Text style={s.info}>Distância: {meters != null ? `${meters.toFixed(1)} m` : "—"}</Text>
+        <Text style={s.info}>
+          Direção: {bearing != null ? `${Math.round(bearing)}°` : "—"}  {"  "}
+          Confiança: {Math.round(bearingConf*100)}%
+        </Text>
+        {bearingConf < 0.35 && (
+          <Text style={s.tip}>Gire devagar 360° para melhorar a direção.</Text>
+        )}
       </View>
 
       <View style={s.row}>
@@ -483,7 +374,7 @@ export default function RadarProximidade(){
           <Text style={s.btnT}>Calibrar @1m</Text>
         </TouchableOpacity>
         <View style={[s.param, {borderColor:"#1F2733"}]}>
-          <Text style={s.paramT}>TX:{txPower} dBm  ·  N:{nPath.toFixed(1)}</Text>
+          <Text style={s.paramT}>TX:{txPower} dBm  ·  N:{nPath.toFixed(1)}</Text>
         </View>
       </View>
     </View>
@@ -497,14 +388,9 @@ const s = StyleSheet.create({
   radarWrap:{ alignSelf:"center", width:SIZE, height:SIZE, borderRadius:R, overflow:"hidden",
     backgroundColor:"#0F131A", borderWidth:1, borderColor:"#1E293B" },
 
-  guideBox:{ marginTop:12, flexDirection:"row", alignItems:"center", gap:12, padding:12, borderRadius:12,
-    backgroundColor:"#121826", borderWidth:1, borderColor:"#1F2733" },
-  arrow:{ fontSize:28, width:38, textAlign:"center" },
-  guideMain:{ color:"#E5E7EB", fontSize:16, fontWeight:"bold" },
-  guideSub:{ color:"#9CA3AF", marginTop:2 },
-
   kpis:{ marginTop:10 },
   info:{ color:"#D1D5DB", marginTop:4 },
+  tip:{ color:"#94A3B8", marginTop:6, fontStyle:"italic" },
 
   row:{ flexDirection:"row", gap:12, marginTop:14, alignItems:"center" },
   btn:{ flex:1, paddingVertical:14, borderRadius:10, alignItems:"center" },
